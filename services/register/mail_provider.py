@@ -342,7 +342,18 @@ def _extract_code(message: dict[str, Any]) -> str | None:
     match = re.search(r"background-color:\s*#F3F3F3[^>]*>[\s\S]*?(\d{6})[\s\S]*?</p>", content, re.I)
     if match:
         return match.group(1)
-    match = re.search(r"(?:Verification code|code is|代码为|验证码)[:\s]*(\d{6})", content, re.I)
+    # OpenAI/iCloud often puts the 6-digit code on its own line after "verification code".
+    match = re.search(
+        r"(?:temporary\s+)?(?:verification|login)\s+code(?:\s+to\s+continue)?[^0-9]{0,120}(\d{6})",
+        content,
+        re.I,
+    )
+    if match and match.group(1) != "177010":
+        return match.group(1)
+    match = re.search(r"(?:Verification code|code is|代码为|验证码|登录代码|验证代码)[:\s]*(\d{6})", content, re.I)
+    if match and match.group(1) != "177010":
+        return match.group(1)
+    match = re.search(r"(?m)^\s*(\d{6})\s*$", content)
     if match and match.group(1) != "177010":
         return match.group(1)
     for code in re.findall(r">\s*(\d{6})\s*<|(?<![#&])\b(\d{6})\b", content):
@@ -1183,36 +1194,11 @@ class ICloudHmeMailProvider(BaseMailProvider):
             "anonymous_id": str(payload.get("anonymous_id") or payload.get("anonymousId") or ""),
         }
 
-    def fetch_latest_message(self, mailbox: dict[str, Any]) -> dict[str, Any] | None:
-        account_id = str(mailbox.get("account_id") or self.account_id).strip() or self.account_id
-        address = str(mailbox.get("address") or "").strip()
-        params = {
-            "account_id": account_id,
-            "limit": self.message_limit,
-        }
-        if address:
-            params["alias"] = address
-        data = self._request("GET", "/api/inbox", params=params, expected=(200,))
-        payload = data.get("data") if isinstance(data, dict) else None
-        if not isinstance(payload, dict):
-            return None
-        messages = payload.get("messages") or []
-        if not isinstance(messages, list) or not messages:
-            return None
-        items = [item for item in messages if isinstance(item, dict)]
-        if not items:
-            return None
-        item = max(
-            items,
-            key=lambda value: (
-                (_parse_received_at(value.get("date") or value.get("received_at") or value.get("timestamp")) or datetime.fromtimestamp(0, tz=timezone.utc)).timestamp(),
-                str(value.get("id") or ""),
-            ),
-        )
+    def _normalize_message(self, item: dict[str, Any], address: str) -> dict[str, Any]:
         text_content = str(item.get("preview") or item.get("text_content") or item.get("body") or item.get("content") or "")
         html_content = str(item.get("html_content") or item.get("html") or "")
-        # If body looks like HTML, put it into html too for code extraction.
-        if "<" in text_content and ">" in text_content and not html_content:
+        # OpenAI mails often arrive as CSS-heavy HTML stripped into preview text.
+        if ("<" in text_content and ">" in text_content) and not html_content:
             html_content = text_content
         return {
             "provider": self.name,
@@ -1226,6 +1212,77 @@ class ICloudHmeMailProvider(BaseMailProvider):
             "to": item.get("to"),
             "raw": item,
         }
+
+    def _fetch_messages(self, mailbox: dict[str, Any]) -> list[dict[str, Any]]:
+        account_id = str(mailbox.get("account_id") or self.account_id).strip() or self.account_id
+        address = str(mailbox.get("address") or "").strip()
+        params = {
+            "account_id": account_id,
+            "limit": self.message_limit,
+        }
+        if address:
+            params["alias"] = address
+        data = self._request("GET", "/api/inbox", params=params, expected=(200,))
+        payload = data.get("data") if isinstance(data, dict) else None
+        if not isinstance(payload, dict):
+            return []
+        messages = payload.get("messages") or []
+        if not isinstance(messages, list) or not messages:
+            # Fallback: general inbox then filter by To header (alias filter may lag).
+            if not address:
+                return []
+            data = self._request(
+                "GET",
+                "/api/inbox",
+                params={"account_id": account_id, "limit": max(self.message_limit, 30)},
+                expected=(200,),
+            )
+            payload = data.get("data") if isinstance(data, dict) else None
+            if not isinstance(payload, dict):
+                return []
+            messages = payload.get("messages") or []
+            if not isinstance(messages, list):
+                return []
+            target = address.lower()
+            messages = [
+                item for item in messages
+                if isinstance(item, dict) and target in str(item.get("to") or "").lower()
+            ]
+        items = [item for item in messages if isinstance(item, dict)]
+        items.sort(
+            key=lambda value: (
+                (_parse_received_at(value.get("date") or value.get("received_at") or value.get("timestamp")) or datetime.fromtimestamp(0, tz=timezone.utc)).timestamp(),
+                str(value.get("id") or ""),
+            ),
+            reverse=True,
+        )
+        return [self._normalize_message(item, address) for item in items]
+
+    def fetch_latest_message(self, mailbox: dict[str, Any]) -> dict[str, Any] | None:
+        items = self._fetch_messages(mailbox)
+        return items[0] if items else None
+
+    def wait_for_code(self, mailbox: dict[str, Any]) -> str | None:
+        """Scan recent mails for OTP; OpenAI code is often not the absolute newest ad/system mail."""
+        seen_value = mailbox.setdefault("_seen_code_message_refs", [])
+        if not isinstance(seen_value, list):
+            seen_value = []
+            mailbox["_seen_code_message_refs"] = seen_value
+        seen_refs = {str(item) for item in seen_value}
+
+        deadline = time.monotonic() + self.conf["wait_timeout"]
+        while time.monotonic() < deadline:
+            for message in self._fetch_messages(mailbox):
+                ref = _message_tracking_ref(message)
+                if ref in seen_refs:
+                    continue
+                code = _extract_code(message)
+                if code:
+                    seen_value.append(ref)
+                    seen_refs.add(ref)
+                    return code
+            time.sleep(max(0.2, self.conf["wait_interval"]))
+        return None
 
     def close(self) -> None:
         try:

@@ -5,9 +5,14 @@ services:
     restart: unless-stopped
     ports:
       - "3030:80"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - ./data:/app/data
       - ./config.json:/app/config.json
+      - ./services:/app/services
+      - ./utils:/app/utils
+      - ./api:/app/api
     environment:
       - TZ=Asia/Shanghai
       # 存储后端配置 (可选值: json, sqlite, postgres, git)

@@ -58,6 +58,7 @@ export function RegisterCard() {
       ...(type === "yyds_mail" ? { api_base: "https://maliapi.215.im/v1", api_key: "", domain: [], subdomain: "", wildcard: false } : {}),
       ...(type === "ddg_mail" ? { ddg_token: "", cf_inbox_jwt: "", cf_domain: [], admin_password: "" } : {}),
       ...(type === "outlook_token" ? { mailboxes: "", mode: "graph", imap_host: "outlook.office365.com", message_limit: 10 } : {}),
+      ...(type === "icloud_hme" ? { api_base: "http://host.docker.internal:8081", account_id: "acc_1", label_prefix: "c2a", message_limit: 20 } : {}),
     });
   };
 
@@ -186,10 +187,11 @@ export function RegisterCard() {
                             <SelectItem value="yyds_mail">yyds_mail</SelectItem>
                             <SelectItem value="ddg_mail">ddg_mail (DDG邮箱+CF中转)</SelectItem>
                             <SelectItem value="outlook_token">outlook_token (Outlook/Hotmail 邮箱池)</SelectItem>
+                            <SelectItem value="icloud_hme">icloud_hme (iCloud Hide My Email)</SelectItem>
                           </SelectContent>
                         </Select>
                       </div>
-                      {type === "cloudmail_gen" || type === "cloudflare_temp_email" || type === "moemail" || type === "inbucket" || type === "yyds_mail" || type === "ddg_mail" ? (
+                      {type === "cloudmail_gen" || type === "cloudflare_temp_email" || type === "moemail" || type === "inbucket" || type === "yyds_mail" || type === "ddg_mail" || type === "icloud_hme" ? (
                         <>
                           <div className="space-y-2">
                             <label className="text-sm text-stone-700">{type === "cloudmail_gen" ? "CloudMail URL" : "API Base"}</label>
@@ -212,6 +214,18 @@ export function RegisterCard() {
                               <label className="text-sm text-stone-700">Admin Password</label>
                               <Input value={String(provider.admin_password || "")} onChange={(event) => updateProvider(index, { admin_password: event.target.value })} className="h-10 rounded-xl border-stone-200 bg-white" disabled={config.enabled} />
                             </div>
+                          ) : null}
+                          {type === "icloud_hme" ? (
+                            <>
+                              <div className="space-y-2">
+                                <label className="text-sm text-stone-700">iCloud Account ID</label>
+                                <Input value={String(provider.account_id || "acc_1")} onChange={(event) => updateProvider(index, { account_id: event.target.value })} className="h-10 rounded-xl border-stone-200 bg-white" disabled={config.enabled} />
+                              </div>
+                              <div className="space-y-2">
+                                <label className="text-sm text-stone-700">Label Prefix</label>
+                                <Input value={String(provider.label_prefix || "c2a")} onChange={(event) => updateProvider(index, { label_prefix: event.target.value })} className="h-10 rounded-xl border-stone-200 bg-white" disabled={config.enabled} />
+                              </div>
+                            </>
                           ) : null}
                         </>
                       ) : null}

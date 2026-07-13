@@ -1116,6 +1116,124 @@ def _normalize_outlook_pool(value: Any) -> list[dict[str, str]]:
     return []
 
 
+
+class ICloudHmeMailProvider(BaseMailProvider):
+    """iCloud Hide My Email via local icloud-hme HTTP API.
+
+    Expected endpoints on api_base (default host.docker.internal:8081):
+      POST /api/create  {"account_id","label"} -> {"success", "data":{"email",...}}
+      GET  /api/inbox?account_id=&alias=&limit=
+    """
+
+    name = "icloud_hme"
+
+    def __init__(self, entry: dict, conf: dict):
+        super().__init__(conf, str(entry.get("provider_ref") or ""))
+        self.api_base = str(entry.get("api_base") or "http://host.docker.internal:8081").rstrip("/")
+        self.account_id = str(entry.get("account_id") or "acc_1").strip() or "acc_1"
+        self.label_prefix = str(entry.get("label_prefix") or "c2a").strip() or "c2a"
+        self.message_limit = max(1, int(entry.get("message_limit") or 20))
+        self.session = _create_session(conf)
+
+    def _request(self, method: str, path: str, params: dict | None = None, payload: dict | None = None, expected: tuple[int, ...] = (200, 201)):
+        url = f"{self.api_base}{path}"
+        resp = self.session.request(
+            method.upper(),
+            url,
+            params=params,
+            json=payload,
+            headers={"Content-Type": "application/json", "User-Agent": self.conf["user_agent"], "Accept": "application/json"},
+            timeout=self.conf["request_timeout"],
+            verify=False,
+        )
+        if resp.status_code not in expected:
+            raise RuntimeError(f"iCloudHME 请求失败: {method} {path}, HTTP {resp.status_code}, body={resp.text[:300]}")
+        if not resp.text.strip():
+            return {}
+        try:
+            data = resp.json()
+        except Exception as error:
+            raise RuntimeError(f"iCloudHME 返回非 JSON: {method} {path}, body={resp.text[:300]}") from error
+        if isinstance(data, dict) and data.get("success") is False:
+            raise RuntimeError(f"iCloudHME 业务失败: {data.get('message') or data}")
+        return data
+
+    def create_mailbox(self, username: str | None = None) -> dict[str, Any]:
+        if not self.account_id:
+            raise RuntimeError("iCloudHME 需要 account_id")
+        label = f"{self.label_prefix}-{username or _random_mailbox_name()}"
+        data = self._request(
+            "POST",
+            "/api/create",
+            payload={"account_id": self.account_id, "label": label},
+            expected=(200, 201),
+        )
+        payload = data.get("data") if isinstance(data, dict) else None
+        if not isinstance(payload, dict):
+            raise RuntimeError(f"iCloudHME create 返回异常: {str(data)[:300]}")
+        address = str(payload.get("email") or payload.get("address") or "").strip()
+        if not address:
+            raise RuntimeError("iCloudHME create 缺少 email")
+        return {
+            "provider": self.name,
+            "provider_ref": self.provider_ref,
+            "address": address,
+            "account_id": self.account_id,
+            "label": str(payload.get("label") or label),
+            "anonymous_id": str(payload.get("anonymous_id") or payload.get("anonymousId") or ""),
+        }
+
+    def fetch_latest_message(self, mailbox: dict[str, Any]) -> dict[str, Any] | None:
+        account_id = str(mailbox.get("account_id") or self.account_id).strip() or self.account_id
+        address = str(mailbox.get("address") or "").strip()
+        params = {
+            "account_id": account_id,
+            "limit": self.message_limit,
+        }
+        if address:
+            params["alias"] = address
+        data = self._request("GET", "/api/inbox", params=params, expected=(200,))
+        payload = data.get("data") if isinstance(data, dict) else None
+        if not isinstance(payload, dict):
+            return None
+        messages = payload.get("messages") or []
+        if not isinstance(messages, list) or not messages:
+            return None
+        items = [item for item in messages if isinstance(item, dict)]
+        if not items:
+            return None
+        item = max(
+            items,
+            key=lambda value: (
+                (_parse_received_at(value.get("date") or value.get("received_at") or value.get("timestamp")) or datetime.fromtimestamp(0, tz=timezone.utc)).timestamp(),
+                str(value.get("id") or ""),
+            ),
+        )
+        text_content = str(item.get("preview") or item.get("text_content") or item.get("body") or item.get("content") or "")
+        html_content = str(item.get("html_content") or item.get("html") or "")
+        # If body looks like HTML, put it into html too for code extraction.
+        if "<" in text_content and ">" in text_content and not html_content:
+            html_content = text_content
+        return {
+            "provider": self.name,
+            "mailbox": address,
+            "message_id": str(item.get("id") or item.get("message_id") or ""),
+            "subject": str(item.get("subject") or ""),
+            "sender": str(item.get("from") or item.get("sender") or ""),
+            "text_content": text_content,
+            "html_content": html_content,
+            "received_at": _parse_received_at(item.get("date") or item.get("received_at") or item.get("timestamp")),
+            "to": item.get("to"),
+            "raw": item,
+        }
+
+    def close(self) -> None:
+        try:
+            self.session.close()
+        except Exception:
+            pass
+
+
 class OutlookTokenProvider(BaseMailProvider):
     """使用 refresh_token 读取 Outlook/Hotmail 邮箱验证码。
 
@@ -1420,6 +1538,8 @@ def _create_provider(mail_config: dict, provider: str = "", provider_ref: str = 
         return YydsMailProvider(entry, conf)
     if entry["type"] == "outlook_token":
         return OutlookTokenProvider(entry, conf)
+    if entry["type"] == "icloud_hme":
+        return ICloudHmeMailProvider(entry, conf)
     raise RuntimeError(f"不支持的 mail.provider: {entry['type']}")
 
 

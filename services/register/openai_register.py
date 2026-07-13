@@ -243,13 +243,18 @@ def wait_for_code(mailbox: dict) -> str | None:
     return mail_provider.wait_for_code(_mail_config(), mailbox)
 
 
-from utils.sentinel import SentinelTokenGenerator, build_sentinel_token as _build_sentinel_token_tuple  # noqa: F401
+from utils.sentinel import SentinelTokenGenerator, build_sentinel_headers as _build_sentinel_headers, build_sentinel_token as _build_sentinel_token_tuple  # noqa: F401
 
 
 def build_sentinel_token(session: requests.Session, device_id: str, flow: str) -> str:
     """请求 sentinel token，返回 sentinel header 字符串（兼容旧接口）。"""
     sentinel_val, _oai_sc_val = _build_sentinel_token_tuple(session, device_id, flow, user_agent=user_agent, sec_ch_ua=sec_ch_ua)
     return sentinel_val
+
+
+def build_create_account_sentinel_headers(session: requests.Session, device_id: str) -> dict[str, str]:
+    """返回 create_account 新协议需要的 Sentinel Token 和 SO Token headers。"""
+    return _build_sentinel_headers(session, device_id, "oauth_create_account", user_agent=user_agent, sec_ch_ua=sec_ch_ua)
 
 
 def create_session(proxy: str = "") -> Any:
@@ -535,7 +540,7 @@ class PlatformRegistrar:
         step(index, "开始创建账号资料")
         url = f"{auth_base}/api/accounts/create_account"
         headers = self._json_headers(f"{auth_base}/about-you")
-        headers["openai-sentinel-token"] = build_sentinel_token(self.session, self.device_id, "oauth_create_account")
+        headers.update(build_create_account_sentinel_headers(self.session, self.device_id))
         headers = _headers_with_clearance(headers, url, self.proxy, self.clearance_user_agent)
         resp, error = request_with_local_retry(self.session, "post", url, json={"name": name, "birthdate": birthdate}, headers=headers, verify=False)
         if _is_cloudflare_challenge(resp):
@@ -543,7 +548,7 @@ class PlatformRegistrar:
             if bundle is None:
                 raise RuntimeError(_cloudflare_block_message(resp, reason=self.clearance_failure_reason))
             headers = self._json_headers(f"{auth_base}/about-you")
-            headers["openai-sentinel-token"] = build_sentinel_token(self.session, self.device_id, "oauth_create_account")
+            headers.update(build_create_account_sentinel_headers(self.session, self.device_id))
             headers = _headers_with_clearance(headers, url, self.proxy, self.clearance_user_agent)
             resp, error = request_with_local_retry(self.session, "post", url, json={"name": name, "birthdate": birthdate}, headers=headers, verify=False)
             if _is_cloudflare_challenge(resp):

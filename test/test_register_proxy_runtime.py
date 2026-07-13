@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from services.proxy_service import ClearanceBundle
@@ -53,6 +54,9 @@ class FakeProxySettings:
         if self.refreshed and self.bundle and self.bundle.cookies:
             merged["Cookie"] = "; ".join(f"{key}={value}" for key, value in self.bundle.cookies.items())
         return merged
+
+    def get_profile(self, proxy="", upstream=True, **kwargs):
+        return SimpleNamespace(clearance_enabled=True)
 
     def refresh_clearance(self, target_url="", proxy="", force=False, upstream=True, **kwargs):
         self.refresh_calls.append({"target_url": target_url, "proxy": proxy, "force": force, "upstream": upstream})
@@ -188,6 +192,39 @@ class RegisterProxyRuntimeTests(unittest.TestCase):
         message = str(ctx.exception)
         self.assertIn("status=403", message)
         self.assertIn("challenge body", message)
+
+    def test_create_account_sends_new_sentinel_and_so_headers(self):
+        request_calls = []
+
+        class CreateAccountResponse(FakeResponse):
+            def __init__(self):
+                super().__init__(status_code=200, text='{"continue_url":"https://platform.openai.com/auth/callback?code=abc&state=st"}', headers={"content-type": "application/json"})
+
+            def json(self):
+                return {"continue_url": "https://platform.openai.com/auth/callback?code=abc&state=st"}
+
+        def fake_request(session, method, url, retry_attempts=3, **kwargs):
+            request_calls.append({"method": method, "url": url, "headers": dict(kwargs.get("headers") or {}), "json": kwargs.get("json")})
+            return CreateAccountResponse(), ""
+
+        def fake_sentinel_headers(session, device_id):
+            return {
+                "openai-sentinel-token": "legacy-sentinel",
+                "OpenAI-Sentinel-Token": "sdk-sentinel",
+                "OpenAI-Sentinel-SO-Token": "so-token",
+            }
+
+        with patch.object(openai_register, "create_session", return_value=FakeSession()), patch.object(
+            openai_register, "request_with_local_retry", side_effect=fake_request
+        ), patch.object(openai_register, "build_create_account_sentinel_headers", side_effect=fake_sentinel_headers):
+            registrar = openai_register.PlatformRegistrar(proxy="")
+            registrar._create_account("Test User", "1990-01-01", 1)
+
+        self.assertEqual(registrar.platform_auth_code, "abc")
+        sent_headers = request_calls[0]["headers"]
+        self.assertEqual(sent_headers["OpenAI-Sentinel-Token"], "sdk-sentinel")
+        self.assertEqual(sent_headers["OpenAI-Sentinel-SO-Token"], "so-token")
+        self.assertEqual(sent_headers["openai-sentinel-token"], "legacy-sentinel")
 
 
 if __name__ == "__main__":

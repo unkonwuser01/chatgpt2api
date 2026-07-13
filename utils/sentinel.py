@@ -9,7 +9,7 @@ import json
 import random
 import time
 import uuid
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from curl_cffi.requests import Session
@@ -93,6 +93,58 @@ DEFAULT_SENTINEL_USER_AGENT = (
 DEFAULT_SENTINEL_SEC_CH_UA = '"Chromium";v="145", "Google Chrome";v="145", "Not/A)Brand";v="99"'
 
 
+def _request_sentinel_challenge(
+    session: "Session",
+    device_id: str,
+    flow: str,
+    *,
+    user_agent: str = "",
+    sec_ch_ua: str = "",
+) -> tuple[SentinelTokenGenerator, dict[str, Any]]:
+    """向官方 Sentinel req 端点申请一次 challenge，返回生成器和响应数据。"""
+    ua = user_agent or DEFAULT_SENTINEL_USER_AGENT
+    ch_ua = sec_ch_ua or DEFAULT_SENTINEL_SEC_CH_UA
+    generator = SentinelTokenGenerator(device_id, ua)
+    resp = session.post(
+        "https://sentinel.openai.com/backend-api/sentinel/req",
+        data=json.dumps({"p": generator.generate_requirements_token(), "id": device_id, "flow": flow}),
+        headers={
+            "Content-Type": "text/plain;charset=UTF-8",
+            "Referer": "https://sentinel.openai.com/backend-api/sentinel/frame.html",
+            "Origin": "https://sentinel.openai.com",
+            "User-Agent": ua,
+            "sec-ch-ua": ch_ua,
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"Windows"',
+        },
+        timeout=20,
+        verify=False,
+    )
+    try:
+        data = resp.json() if resp.text else {}
+    except Exception as error:
+        raise RuntimeError(f"sentinel_req_invalid_json_{getattr(resp, 'status_code', 'unknown')}") from error
+    if resp.status_code != 200:
+        raise RuntimeError(f"sentinel_req_failed_{resp.status_code}")
+    return generator, data
+
+
+def _build_sentinel_value(generator: SentinelTokenGenerator, data: dict[str, Any], device_id: str, flow: str) -> tuple[str, str]:
+    token = str(data.get("token") or "").strip()
+    if not token:
+        raise RuntimeError("sentinel_req_missing_token")
+    pow_data = data.get("proofofwork") or {}
+    p_value = (
+        generator.generate_token(str(pow_data.get("seed") or ""), str(pow_data.get("difficulty") or "0"))
+        if pow_data.get("required") and pow_data.get("seed")
+        else generator.generate_requirements_token()
+    )
+    sentinel_value = json.dumps({"p": p_value, "t": "", "c": token, "id": device_id, "flow": flow}, separators=(",", ":"))
+    # oai-sc cookie = "0" + sentinel token "c" value (the challenge token from the server)
+    oai_sc_value = "0" + token
+    return sentinel_value, oai_sc_value
+
+
 def build_sentinel_token(
     session: "Session",
     device_id: str,
@@ -116,44 +168,45 @@ def build_sentinel_token(
     Raises:
         RuntimeError: sentinel 请求失败
     """
-    ua = user_agent or DEFAULT_SENTINEL_USER_AGENT
-    ch_ua = sec_ch_ua or DEFAULT_SENTINEL_SEC_CH_UA
-    generator = SentinelTokenGenerator(device_id, ua)
-    resp = session.post(
-        "https://sentinel.openai.com/backend-api/sentinel/req",
-        data=json.dumps({"p": generator.generate_requirements_token(), "id": device_id, "flow": flow}),
-        headers={
-            "Content-Type": "text/plain;charset=UTF-8",
-            "Referer": "https://sentinel.openai.com/backend-api/sentinel/frame.html",
-            "Origin": "https://sentinel.openai.com",
-            "User-Agent": ua,
-            "sec-ch-ua": ch_ua,
-            "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": '"Windows"',
-        },
-        timeout=20,
-        verify=False,
+    generator, data = _request_sentinel_challenge(
+        session,
+        device_id,
+        flow,
+        user_agent=user_agent,
+        sec_ch_ua=sec_ch_ua,
     )
+    return _build_sentinel_value(generator, data, device_id, flow)
 
-    try:
-        data = resp.json() if resp.text else {}
-    except Exception:
-        fallback = json.dumps(
-            {"p": generator.generate_requirements_token(), "t": "", "c": "", "id": device_id, "flow": flow},
-            separators=(",", ":"),
-        )
-        return fallback, ""
 
-    token = str(data.get("token") or "").strip()
-    if resp.status_code != 200 or not token:
-        raise RuntimeError(f"sentinel_req_failed_{resp.status_code}")
-    pow_data = data.get("proofofwork") or {}
-    p_value = (
-        generator.generate_token(str(pow_data.get("seed") or ""), str(pow_data.get("difficulty") or "0"))
-        if pow_data.get("required") and pow_data.get("seed")
-        else generator.generate_requirements_token()
+def build_sentinel_headers(
+    session: "Session",
+    device_id: str,
+    flow: str,
+    *,
+    user_agent: str = "",
+    sec_ch_ua: str = "",
+) -> dict[str, str]:
+    """请求官方 Sentinel challenge，返回新注册接口需要的 Sentinel/SO headers。
+
+    create_account 目前要求同时携带：
+    - OpenAI-Sentinel-Token: SDK/PoW 生成的 sentinel token
+    - OpenAI-Sentinel-SO-Token: Sentinel req 响应中的 so 字段
+
+    为兼容部分旧端点，同时保留小写 openai-sentinel-token。
+    """
+    generator, data = _request_sentinel_challenge(
+        session,
+        device_id,
+        flow,
+        user_agent=user_agent,
+        sec_ch_ua=sec_ch_ua,
     )
-    sentinel_value = json.dumps({"p": p_value, "t": "", "c": token, "id": device_id, "flow": flow}, separators=(",", ":"))
-    # oai-sc cookie = "0" + sentinel token "c" value (the challenge token from the server)
-    oai_sc_value = "0" + token
-    return sentinel_value, oai_sc_value
+    sentinel_value, _oai_sc_value = _build_sentinel_value(generator, data, device_id, flow)
+    so_token = str(data.get("so") or data.get("soToken") or data.get("so_token") or "").strip()
+    if not so_token:
+        raise RuntimeError("sentinel_req_missing_so_token")
+    return {
+        "openai-sentinel-token": sentinel_value,
+        "OpenAI-Sentinel-Token": sentinel_value,
+        "OpenAI-Sentinel-SO-Token": so_token,
+    }

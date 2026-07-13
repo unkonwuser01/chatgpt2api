@@ -13,6 +13,7 @@ services:
       - ./services:/app/services
       - ./utils:/app/utils
       - ./api:/app/api
+      - ./web_dist:/app/web_dist
     environment:
       - TZ=Asia/Shanghai
       # 存储后端配置 (可选值: json, sqlite, postgres, git)

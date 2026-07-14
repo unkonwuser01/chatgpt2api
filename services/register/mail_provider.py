@@ -29,6 +29,11 @@ OUTLOOK_IN_USE_STALE_SECONDS = 3600
 OUTLOOK_RECORDED_STATES = {"used", "in_use", "token_invalid", "failed"}
 OUTLOOK_UNAVAILABLE_STATES = {"used", "token_invalid", "failed"}
 
+ICLOUD_HME_POOL_FILE = DATA_DIR / "icloud_hme_pool.json"
+_icloud_hme_pool_lock = Lock()
+# in_use 超过该秒数视为陈旧（注册进程崩溃残留），可被重新领用
+ICLOUD_HME_IN_USE_STALE_SECONDS = 3600
+
 
 def _load_ddg_aliases() -> set[str]:
     try:
@@ -1131,8 +1136,15 @@ def _normalize_outlook_pool(value: Any) -> list[dict[str, str]]:
 class ICloudHmeMailProvider(BaseMailProvider):
     """iCloud Hide My Email via local icloud-hme HTTP API.
 
+    策略（省配额）:
+      1) 优先复用账号下已有 active 别名
+      2) 没有可用别名时才 POST /api/create 新建
+      3) 注册结束（成功/失败）后删除该别名（用完一个删一个）
+
     Expected endpoints on api_base (default host.docker.internal:8081):
       POST /api/create  {"account_id","label"} -> {"success", "data":{"email",...}}
+      GET  /api/aliases?account_id=
+      DELETE /api/aliases/:anonymous_id  {"account_id":...}
       GET  /api/inbox?account_id=&alias=&limit=
     """
 
@@ -1144,6 +1156,11 @@ class ICloudHmeMailProvider(BaseMailProvider):
         self.account_id = str(entry.get("account_id") or "acc_1").strip() or "acc_1"
         self.label_prefix = str(entry.get("label_prefix") or "c2a").strip() or "c2a"
         self.message_limit = max(1, int(entry.get("message_limit") or 20))
+        # reuse_existing: 优先用已有别名；delete_after_use: 用完删除
+        self.reuse_existing = bool(entry.get("reuse_existing", True))
+        self.delete_after_use = bool(entry.get("delete_after_use", True))
+        # preferred_label_prefix: 仅复用带此前缀的别名；空=所有 active
+        self.preferred_label_prefix = str(entry.get("preferred_label_prefix") or self.label_prefix).strip()
         self.session = _create_session(conf)
 
     def _request(self, method: str, path: str, params: dict | None = None, payload: dict | None = None, expected: tuple[int, ...] = (200, 201)):
@@ -1169,7 +1186,143 @@ class ICloudHmeMailProvider(BaseMailProvider):
             raise RuntimeError(f"iCloudHME 业务失败: {data.get('message') or data}")
         return data
 
-    def create_mailbox(self, username: str | None = None) -> dict[str, Any]:
+    # ---------- local lease pool (prevent concurrent reuse of same alias) ----------
+    @staticmethod
+    def _load_pool() -> dict[str, Any]:
+        try:
+            if ICLOUD_HME_POOL_FILE.exists():
+                data = json.loads(ICLOUD_HME_POOL_FILE.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    return data
+        except Exception:
+            pass
+        return {}
+
+    @staticmethod
+    def _save_pool(data: dict[str, Any]) -> None:
+        ICLOUD_HME_POOL_FILE.parent.mkdir(parents=True, exist_ok=True)
+        ICLOUD_HME_POOL_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    def _pool_key(self, address: str = "", anonymous_id: str = "") -> str:
+        addr = str(address or "").strip().lower()
+        aid = str(anonymous_id or "").strip()
+        if addr:
+            return f"{self.account_id}|{addr}"
+        if aid:
+            return f"{self.account_id}|id:{aid}"
+        return f"{self.account_id}|unknown"
+
+    def _lease_alias(self, address: str, anonymous_id: str) -> bool:
+        """Try to mark alias in_use. Return False if already leased by another worker."""
+        key = self._pool_key(address, anonymous_id)
+        now = time.time()
+        with _icloud_hme_pool_lock:
+            pool = self._load_pool()
+            item = pool.get(key) if isinstance(pool.get(key), dict) else None
+            if item:
+                state = str(item.get("state") or "")
+                ts = float(item.get("ts") or 0)
+                if state == "in_use" and (now - ts) < ICLOUD_HME_IN_USE_STALE_SECONDS:
+                    return False
+            pool[key] = {
+                "state": "in_use",
+                "ts": now,
+                "address": str(address or "").strip().lower(),
+                "anonymous_id": str(anonymous_id or "").strip(),
+                "account_id": self.account_id,
+            }
+            self._save_pool(pool)
+            return True
+
+    def _release_alias(self, address: str = "", anonymous_id: str = "") -> None:
+        key = self._pool_key(address, anonymous_id)
+        with _icloud_hme_pool_lock:
+            pool = self._load_pool()
+            if key in pool:
+                pool.pop(key, None)
+                self._save_pool(pool)
+
+    def _list_aliases(self) -> list[dict[str, Any]]:
+        data = self._request(
+            "GET",
+            "/api/aliases",
+            params={"account_id": self.account_id},
+            expected=(200,),
+        )
+        payload = data.get("data") if isinstance(data, dict) else None
+        if not isinstance(payload, dict):
+            return []
+        aliases = payload.get("aliases") or []
+        return [item for item in aliases if isinstance(item, dict)]
+
+    def _resolve_anonymous_id(self, address: str, anonymous_id: str = "") -> str:
+        aid = str(anonymous_id or "").strip()
+        if aid:
+            return aid
+        target = str(address or "").strip().lower()
+        if not target:
+            return ""
+        try:
+            for item in self._list_aliases():
+                email = str(item.get("email") or item.get("address") or "").strip().lower()
+                if email == target:
+                    return str(item.get("anonymousId") or item.get("anonymous_id") or item.get("id") or "").strip()
+        except Exception:
+            return ""
+        return ""
+
+    def _pick_existing_alias(self) -> dict[str, Any] | None:
+        """Pick an active alias not currently leased. Prefer label_prefix matches."""
+        aliases = self._list_aliases()
+        if not aliases:
+            return None
+
+        def norm(item: dict[str, Any]) -> dict[str, Any] | None:
+            email = str(item.get("email") or item.get("address") or "").strip()
+            if not email or "@" not in email:
+                return None
+            active = item.get("active")
+            if active is False:
+                return None
+            state = str(item.get("state") or item.get("status") or "").lower()
+            if state in {"inactive", "deleted", "disabled"}:
+                return None
+            aid = str(item.get("anonymousId") or item.get("anonymous_id") or item.get("id") or "").strip()
+            label = str(item.get("label") or "")
+            return {
+                "provider": self.name,
+                "provider_ref": self.provider_ref,
+                "address": email,
+                "account_id": self.account_id,
+                "label": label,
+                "anonymous_id": aid,
+                "reused": True,
+            }
+
+        preferred: list[dict[str, Any]] = []
+        others: list[dict[str, Any]] = []
+        prefix = self.preferred_label_prefix.lower()
+        for item in aliases:
+            mb = norm(item)
+            if not mb:
+                continue
+            label_l = str(mb.get("label") or "").lower()
+            if prefix and label_l.startswith(prefix.lower()):
+                preferred.append(mb)
+            else:
+                others.append(mb)
+
+        for candidate in preferred + others:
+            if self._lease_alias(candidate["address"], candidate.get("anonymous_id") or ""):
+                # ensure anonymous_id present for later delete
+                if not candidate.get("anonymous_id"):
+                    candidate["anonymous_id"] = self._resolve_anonymous_id(candidate["address"])
+                candidate["api_base"] = self.api_base
+                candidate["delete_after_use"] = self.delete_after_use
+                return candidate
+        return None
+
+    def _create_new_alias(self, username: str | None = None) -> dict[str, Any]:
         if not self.account_id:
             raise RuntimeError("iCloudHME 需要 account_id")
         label = f"{self.label_prefix}-{username or _random_mailbox_name()}"
@@ -1185,14 +1338,61 @@ class ICloudHmeMailProvider(BaseMailProvider):
         address = str(payload.get("email") or payload.get("address") or "").strip()
         if not address:
             raise RuntimeError("iCloudHME create 缺少 email")
-        return {
+        anonymous_id = str(payload.get("anonymous_id") or payload.get("anonymousId") or "").strip()
+        if not anonymous_id:
+            # create API 可能不回 anonymousId，列表反查
+            anonymous_id = self._resolve_anonymous_id(address)
+        mailbox = {
             "provider": self.name,
             "provider_ref": self.provider_ref,
             "address": address,
             "account_id": self.account_id,
             "label": str(payload.get("label") or label),
-            "anonymous_id": str(payload.get("anonymous_id") or payload.get("anonymousId") or ""),
+            "anonymous_id": anonymous_id,
+            "reused": False,
+            "api_base": self.api_base,
+            "delete_after_use": self.delete_after_use,
         }
+        # 新创建也占坑，避免并发立刻复用同一新别名
+        self._lease_alias(address, anonymous_id)
+        return mailbox
+
+    def create_mailbox(self, username: str | None = None) -> dict[str, Any]:
+        if self.reuse_existing:
+            try:
+                existing = self._pick_existing_alias()
+                if existing:
+                    return existing
+            except Exception:
+                # 列别名失败时回退创建，不阻断注册
+                pass
+        return self._create_new_alias(username)
+
+    def delete_mailbox(self, mailbox: dict[str, Any]) -> None:
+        """Delete HME alias after use. Best-effort: never raise to caller."""
+        if not self.delete_after_use:
+            self._release_alias(str(mailbox.get("address") or ""), str(mailbox.get("anonymous_id") or ""))
+            return
+        address = str(mailbox.get("address") or "").strip()
+        anonymous_id = str(mailbox.get("anonymous_id") or "").strip()
+        account_id = str(mailbox.get("account_id") or self.account_id).strip() or self.account_id
+        try:
+            if not anonymous_id:
+                anonymous_id = self._resolve_anonymous_id(address, anonymous_id)
+            if not anonymous_id:
+                # 无 id 无法删，只释放本地锁
+                return
+            self._request(
+                "DELETE",
+                f"/api/aliases/{anonymous_id}",
+                payload={"account_id": account_id},
+                expected=(200, 204),
+            )
+        except Exception:
+            # 删除失败不阻断主流程
+            pass
+        finally:
+            self._release_alias(address, anonymous_id)
 
     def _normalize_message(self, item: dict[str, Any], address: str) -> dict[str, Any]:
         text_content = str(item.get("preview") or item.get("text_content") or item.get("body") or item.get("content") or "")
@@ -1633,10 +1833,46 @@ def wait_for_code(mail_config: dict, mailbox: dict) -> str | None:
 def mark_mailbox_result(mailbox: dict, *, success: bool, error: Exception | str | None = None) -> None:
     """注册流程结束后更新邮箱池状态。
 
-    仅对 outlook_token 邮箱生效：成功标记 used；失败时若是 token 失效标记 token_invalid，
-    其余失败标记 failed（保留邮箱占用以便排查，可通过重置释放）。
+    - outlook_token: 成功 used；token 失效 token_invalid；其它 failed
+    - icloud_hme: 用完即删（成功/失败都删），避免 HME 别名无限堆积
     """
-    if str(mailbox.get("provider") or "") != OutlookTokenProvider.name:
+    provider_name = str(mailbox.get("provider") or "")
+    if provider_name == ICloudHmeMailProvider.name:
+        conf = {
+            "user_agent": "Mozilla/5.0",
+            "request_timeout": 40,
+            "wait_timeout": 120,
+            "wait_interval": 5,
+            "proxy": "",
+        }
+        # 尊重 mailbox 上携带的 delete_after_use；默认 True
+        delete_after = mailbox.get("delete_after_use")
+        if delete_after is None:
+            delete_after = True
+        try:
+            provider = ICloudHmeMailProvider(
+                {
+                    "api_base": mailbox.get("api_base") or "http://host.docker.internal:8081",
+                    "account_id": mailbox.get("account_id") or "acc_1",
+                    "provider_ref": mailbox.get("provider_ref") or "",
+                    "label_prefix": mailbox.get("label_prefix") or "c2a",
+                    "delete_after_use": bool(delete_after),
+                    "reuse_existing": False,
+                },
+                conf,
+            )
+        except Exception:
+            return
+        try:
+            provider.delete_mailbox(mailbox)
+        finally:
+            try:
+                provider.close()
+            except Exception:
+                pass
+        return
+
+    if provider_name != OutlookTokenProvider.name:
         return
     address = str(mailbox.get("address") or "").strip()
     if not address:
@@ -1652,8 +1888,16 @@ def mark_mailbox_result(mailbox: dict, *, success: bool, error: Exception | str 
 
 
 def release_mailbox(mailbox: dict) -> None:
-    """把 outlook_token 邮箱从 in_use 释放回未使用（用于流程主动放弃且未消费验证码时）。"""
-    if str(mailbox.get("provider") or "") != OutlookTokenProvider.name:
+    """释放邮箱占用。
+
+    - outlook_token: in_use -> 未使用
+    - icloud_hme: 主动放弃时也删除别名（用完一个删一个）
+    """
+    provider_name = str(mailbox.get("provider") or "")
+    if provider_name == ICloudHmeMailProvider.name:
+        mark_mailbox_result(mailbox, success=False, error="released")
+        return
+    if provider_name != OutlookTokenProvider.name:
         return
     _release_outlook_token_state(str(mailbox.get("address") or ""))
 
